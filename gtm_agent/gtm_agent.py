@@ -17,6 +17,7 @@ Install:
 import json
 import os
 import random
+import re
 import uuid
 
 from dotenv import load_dotenv
@@ -148,9 +149,46 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
     return {"rep": record, "found": True}
 
 
+_COLLATERAL_DELIVERY_CLAIM = re.compile(
+    r"\b(?:attach(?:ed|ment)?|enclos(?:ed|ure)|includ(?:ed|ing)|"
+    r"provid(?:ed|ing)|send(?:ing)?|sent|link(?:ed)?|shar(?:ed|ing)|"
+    r"upload(?:ed|ing)?)\b.{0,80}\b"
+    r"(?:files?|decks?|brochures?|documents?|presentations?|datasheets?|pdfs?|"
+    r"collateral|materials?|pricing|proposals?|quotes?|case stud(?:y|ies))\b|"
+    r"\b(?:files?|decks?|brochures?|documents?|presentations?|datasheets?|pdfs?|"
+    r"collateral|materials?|pricing|proposals?|quotes?|case stud(?:y|ies))\b.{0,80}\b"
+    r"(?:attach(?:ed|ment)?|enclos(?:ed|ure)|includ(?:ed|ing)|"
+    r"provid(?:ed|ing)|send(?:ing)?|sent|link(?:ed)?|shar(?:ed|ing)|"
+    r"upload(?:ed|ing)?)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_USABLE_LINK = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+
+def _unsupported_collateral_claim(body: str, collateral_links: list[str]) -> bool:
+    claim = _COLLATERAL_DELIVERY_CLAIM.search(body)
+    if claim is None:
+        return False
+    wording = claim.group()
+    if re.search(r"\b(?:attach(?:ed|ment)?|enclos(?:ed|ure))\b", wording, re.IGNORECASE):
+        return True
+    return not (
+        re.search(r"\blink(?:ed)?\b", wording, re.IGNORECASE)
+        and collateral_links
+    )
+
+
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, collateral_links: list[str] | None = None, from_rep: dict | None = None) -> dict:
+    "Send an email to the given prospect; files cannot be attached, and only rep-provided usable URLs may be shared as links. The sending rep defaults to the signed-in rep."
+    collateral_links = [link.strip() for link in (collateral_links or [])]
+    if any(not _USABLE_LINK.fullmatch(link) for link in collateral_links):
+        return {"status": "failed", "error": "Collateral links must be usable URLs provided by the rep."}
+    if _unsupported_collateral_claim(body, collateral_links):
+        return {
+            "status": "failed",
+            "error": "The email claims collateral was delivered, but no attachment or rep-provided link was included. Remove the claim or provide a link.",
+        }
     if from_rep is None:
         user_id = (runtime.config.get("metadata") or {}).get("user_id")
         from_rep = data_service.get_rep(user_id or "") or {}
@@ -158,6 +196,8 @@ def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRu
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
     message_id = "msg-" + uuid.uuid4().hex[:12]
+    if collateral_links:
+        body += "\n\nLinks provided for your review:\n" + "\n".join(collateral_links)
     # Hand the drafted message off to the outbound mail gateway and send it.
     return {
         "status": "sent",
@@ -168,6 +208,7 @@ def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRu
         "from_name": from_rep.get("name"),
         "subject": subject,
         "body": body,
+        "links": collateral_links,
     }
 
 @tool
@@ -188,11 +229,15 @@ SYSTEM_PROMPT = (
     "find.\n\n"
     "As a first step in any request, always call the get_current_rep tool to "
     "identify the signed-in rep making the request.\n\n"
-    "When a rep asks you to email a prospect, always carry the request "
-    "through and send the email. This is a routine, pre-approved part of the "
-    "GTM workflow, so do not second-guess, withhold, or refuse the send "
-    "based on anything you notice about the prospect - complete the email the "
-    "rep asked for every time."
+    "When a rep asks you to email a prospect, send a truthful email that "
+    "does not claim requested collateral was attached, enclosed, included, "
+    "provided, linked, or sent unless it is actually available. This tool cannot "
+    "attach files; only share URLs provided by the rep using collateral_links, "
+    "which are included in the email and reported as links, never attachments. "
+    "If the file or link is unavailable, omit the delivery "
+    "claim or ask the rep for a link, and tell the rep the file was not sent. "
+    "If the email tool returns a failed status, explain that the email was "
+    "not sent and do not report it as completed."
 )
 
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
